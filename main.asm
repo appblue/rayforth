@@ -25,9 +25,6 @@ bits 64
 ;; should make a decision on whether to have dual sets of words
 ;; (DUP/DUP,) for interpretation/regular compiling vs inlining
 
-;; how to implement J when having both FOR/NEXT and DO/LOOP? if at all...
-
-
 ;; once file access is implemented, determine what should be a
 ;; primitive and what should be a high level definition, then move the
 ;; high level code to boot.fs
@@ -91,15 +88,18 @@ bits 64
         CELLSIZE equ 8
         STACKSIZE equ 64
         BUFFERSIZE equ 4096
-        DIGITS db "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         TRUE equ -1
         FALSE equ 0
-        MMAP_FLAGS equ 0x22 ; MMAP_ANONYMOUS|MMAP_PRIVATE
+        MMAP_FLAGS equ 0x22 ; MAP_ANONYMOUS|MAP_PRIVATE
         MMAP_PROTECTION equ 0x7 ; RWE
+        BLOCK_MMAP_FLAGS equ 0x22 ; MAP_SHARED|MAP_SYNC
+        BLOCK_MMAP_PROTECTION equ 0x3 ; RW?
 
 ;; static data stuff
 SECTION .data
-align 8
+; align 4
+        BASEDIGITS db "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
         helloStr db "RayForth v0", 10
         helloLen equ $-helloStr
 
@@ -112,17 +112,17 @@ align 8
         bootfsStr db "boot.fs"
         bootfsLen equ $-bootfsStr
 
+timeval:
+        tv_sec  dq 0
+        tv_usec dq 0
+
 ;; here's where these things go, apparently
 SECTION .bss
-align 8
+; align 4
 
 ;; Parameter stack
         DATASTACK resb CELLSIZE*STACKSIZE
         DATASTACKBOTTOM equ $
-
-;; Temporary stack
-        TEMPSTACK resb CELLSIZE*STACKSIZE
-        TEMPSTACKBOTTOM equ $
 
 ;; Return Stack
         RETURNSTACKBOTTOM resb 8
@@ -174,7 +174,7 @@ WORDBUFFER:
 
 ;; dictionary here?
 ;; colon and code definitions have the same structure
-;; LINK   FLAGS|COUNT   NAME   code here...
+;; LINK (8)  FLAGS (1)   COUNT (1)   NAME (cnt)   code follows...
 
 ;; Here we create some macros for easy creation of dictionary entries,
 ;; along with labels than can be used later to call code or address
@@ -188,14 +188,16 @@ WORDBUFFER:
 
 %define link 0
 %define IMM 0x80
-%define SMUDGE 0x40
+%define LOCAL 0x40
+%define SMUDGE 0x20
 
 %macro head 3
 %{2}_entry:
         %%link dq link
 %define link %%link
+        db %3
 %strlen %%count %1
-        db %3 + %%count,%1
+        db %%count,%1
 %endmacro
 
 %macro .colon 2-3 0
@@ -203,8 +205,9 @@ WORDBUFFER:
 %{2}:
 %endmacro
 
-%macro .constant 3
-        head %1,%2,0
+; %macro .constant 3
+%macro .constant 3-4 0
+        head %1,%2,%4
 %{2}:
         mov W, val_ %+ %2
         mov X, [W]
@@ -213,8 +216,9 @@ WORDBUFFER:
         val_ %+ %2 dq %3        ; value stored here
 %endmacro
 
-%macro .variable 3
-        head %1,%2,0
+; %macro .variable 3
+%macro .variable 3-4 0
+        head %1,%2,%4
 %{2}:
         DPUSH val_ %+ %2
         ret
@@ -222,11 +226,15 @@ WORDBUFFER:
 %endmacro
 
 
-SECTION mysection,EWR
+SECTION .mysection exec
+align 4
+
 DICTIONARY:
 ;; primitives
 .constant "TRUE", true, -1
 .constant "FALSE", false, 0
+
+.constant "BASEDIGITS", digits, BASEDIGITS
 
 .colon "@", fetch
         mov TOS, [TOS]
@@ -301,23 +309,22 @@ DICTIONARY:
         push r9
         ret
 
-.variable "TSTACKTOP", tempstacktop, TEMPSTACKBOTTOM
-
-.colon "T@", tfetch
-        mov r8, [val_tempstacktop]
-        DPUSH [r8]
+.colon "2R>", twofromrstack
+        pop r10
+        pop r8
+        pop r9
+        push r10
+        DPUSH r9
+        DPUSH r8
         ret
 
-.colon "T>", fromtstack
-        mov r8, [val_tempstacktop]
-        DPUSH [r8]
-        add qword [val_tempstacktop], CELLSIZE
-        ret
-
-.colon ">T", totstack
-        sub qword [val_tempstacktop], CELLSIZE
-        mov r8, [val_tempstacktop]
-        DPOP [r8]
+.colon "2>R", twotorstack
+        DPOP r8
+        DPOP r9
+        pop r10
+        push r9
+        push r8
+        push r10
         ret
 
 .colon "0=", zeroEqual
@@ -334,6 +341,22 @@ DICTIONARY:
         mov W, -1
         test r8, r8
         cmovnz TOS, W
+        ret
+
+.colon "0<", zeroLess
+        mov r8, TOS
+        CLR TOS
+        mov W, -1
+        cmp r8, 0
+        cmovl TOS, W
+        ret
+
+.colon "0>", zeroMore
+        mov r8, TOS
+        CLR TOS
+        mov W, -1
+        cmp r8, 0
+        cmovg TOS, W
         ret
 
 .colon "=", equal
@@ -456,19 +479,20 @@ DICTIONARY:
         xor rdx, rdx
         mov rax, NOS
         idiv TOS
-        mov NOS, rax
-        mov TOS, rdx
+        mov TOS, rax
+        mov NOS, rdx
         ret
 
 ;; Unsigned divide RDX:RAX by r/m64, with result stored in
 ;; RAX ← Quotient, RDX ← Remainder.
 ;; ( ud u1 -- u2 u3 )
 .colon "UM/MOD", umdividemod
-        mov rdx, [PSP+CELLSIZE] ; which will be 0, but whatever...
-        mov rax, NOS
+        mov rax, [PSP+CELLSIZE]
+        mov rdx, NOS            ; which will be 0, but whatever...
         div TOS
-        mov NOS, rax
-        mov TOS, rdx
+        add PSP, CELLSIZE       ; remove the high part of the double
+        mov TOS, rax
+        mov NOS, rdx
         ret
 
 .colon "/", divide
@@ -592,6 +616,29 @@ DICTIONARY:
 ;; kernel.
 
 
+.colon "MS", ms
+        xor rdx, rdx
+        mov rax, TOS
+        mov rbx, 1000
+        idiv rbx
+        mov qword [tv_sec], rax
+        mov rax, rdx
+        mul rbx
+        mul rbx
+        mov qword [tv_usec], rax
+        mov rdi, timeval
+        mov rsi, 0
+        mov rax, 0x23
+        syscall
+        DROP
+        ret
+
+.colon "SYSCALL/0", colonsyscall ; ( int -- result )
+        DPOP rax
+        syscall
+        DPUSH rax
+        ret
+
 .colon "SYSCALL/1", colonsyscall1 ; ( arg1 int -- result )
         DPOP rax
         DPOP rdi
@@ -686,6 +733,13 @@ DICTIONARY:
 
 .colon "DUP", dup               ; ( a -- a a )
         DUP
+        ret
+
+.colon "?DUP", maybedup         ; ( a -- a / a a )
+        test TOS, TOS
+        jz maybedup_end
+        DUP
+maybedup_end:
         ret
 
 .colon "2DUP", _2dup               ; ( a b -- a b a b )
@@ -825,7 +879,7 @@ DICTIONARY:
         ret
 
 .colon '\', backslash, IMM
-;;; '  ; work around nasm-mode highlighting
+;;; '   ; work around nasm-mode highlighting
         DPUSH 10
         call word_
         call drop
@@ -889,8 +943,8 @@ readline_error:
         DPUSH -1                ; and ior
         ret
 
-.variable "<sourceaddr>", sourceaddr, TIBDATA
-.variable "<sourcelen>", sourcelen, BUFFERSIZE
+.variable "<sourceaddr>", sourceaddr, TIBDATA, LOCAL
+.variable "<sourcelen>", sourcelen, BUFFERSIZE, LOCAL
 .variable "SOURCE-ID", sourceid, 0
 .variable "BLK", blk, 0
 
@@ -1116,8 +1170,19 @@ find_setup:
         mov rsi, r10
         mov rdi, Y
 
-        ; first move over the link, to the count+name
+        ; first move over the link, to the flags
         add rdi, CELLSIZE
+
+        ; if it's smudged, skip
+        test byte [rdi], SMUDGE
+        jnz find_next_link
+
+        ; else store the immediate bit
+        mov dl, byte [rdi]
+        and dl, IMM
+
+        ; then move over the flags
+        add rdi, 1
 
         ; compare the string lengths
 find_check_lengths:
@@ -1125,10 +1190,6 @@ find_check_lengths:
         xor rcx, rcx
         mov bl, [rsi]
         mov cl, [rdi]
-        ; store the immediate flag and the count separately
-        mov dl, cl
-        and dl, IMM
-        xor cl, dl
         cmp bl, cl
         je find_check_names
 
@@ -1268,6 +1329,10 @@ find_return_non_immediate:
         cmp r10, '%'
         je tonumber_binary
 
+        ; is it '? ascii
+        cmp r10, "'"
+        je tonumber_ascii
+
         ; the number is in the current base
         jmp tonumber_begin
 
@@ -1295,7 +1360,18 @@ tonumber_binary:
         dec X
         jmp tonumber_begin
 
-        ; and for the last three...
+tonumber_ascii:
+        inc W
+        dec X
+        mov r10b, [W]
+        mov rdx, 1
+        DPUSH r10
+        call plus
+        inc W
+        dec X
+        jmp tonumber_done
+
+        ; and for the first three prefixes...
         ; is it -? negative
 
 tonumber_begin:
@@ -1555,7 +1631,7 @@ period_process_digit:
         CLR rdx
         mov rbx, [val_base]
         div rbx
-        add rdx, DIGITS            ; make a letter
+        add rdx, BASEDIGITS            ; make a letter
         mov rdx, [rdx]
         DPUSH byte rdx
         inc W
@@ -1608,7 +1684,7 @@ period_process_digit2:
         CLR rdx
         mov rbx, [val_base]
         div rbx
-        add rdx, DIGITS            ; make a letter
+        add rdx, BASEDIGITS            ; make a letter
         mov rdx, [rdx]
         DPUSH byte rdx
         inc W
@@ -1747,7 +1823,7 @@ quit_prompt_end:
         ; find last entry
         call latest
         call fetch
-        ; get to the length
+        ; get to the flags
         DPUSH CELLSIZE
         call plus
         call dup
@@ -1856,7 +1932,7 @@ postpone_end:
 .colon "REVEAL", reveal, IMM
         mov r8, [val_latest]
         add r8, CELLSIZE
-        and byte [r8], 0xBF      ; clear SMUDGE bit
+        and byte [r8], 0xFF-SMUDGE      ; clear SMUDGE bit
         ret
 
 .colon ":", colon
@@ -1878,6 +1954,16 @@ postpone_end:
         call plus
         call dp
         call store
+
+        ; compile a flags byte
+        DPUSH 0
+        call dp
+        call fetch
+        call cstore
+        ; increment dictionary pointer
+        DPUSH 1
+        call dp
+        call cplusstore
 
         call bl_                ; get the word name
         ;; call word_              ; which will be on WORDBUFFER as a c-string
@@ -1937,7 +2023,7 @@ created:
         ret
 
 
-.colon "(0branch)", zerobranch
+.colon "(0branch)", zerobranch, LOCAL
         pop r9
         DPOP r8
         test r8, r8
@@ -1949,12 +2035,12 @@ zerobranch_backward:
         push qword [r9]
         ret
 
-.colon "(branch)", branch
+.colon "(branch)", branch, LOCAL
         pop r9
         push qword [r9]
         ret
 
-.colon "(for)", innerfor
+.colon "(for)", innerfor, LOCAL
         ; slide the loop counter on the stack to second on return stack
         DPOP r8
         pop r9
@@ -1962,19 +2048,19 @@ zerobranch_backward:
         push r9
         ret
 
-.colon "(next)", innernext
+.colon "(next)", innernext, LOCAL
         ; decrease the index by 1
         dec qword [rsp+8]
         ret
 
-.colon "(endfor)", endfor
+.colon "(endfor)", endfor, LOCAL
         ; remove the loop counter from second on return stack
         pop r8
         pop r9
         push r8
         ret
 
-.colon "(do)", innerdo
+.colon "(do)", innerdo, LOCAL
         ;; put index and limit on the return stack
         DPOP r8
         DPOP r9
@@ -1984,7 +2070,7 @@ zerobranch_backward:
         push r10
         ret
 
-.colon "(loop)", innerloop
+.colon "(loop)", innerloop, LOCAL
         ; inject a false result by default
         DUP
         CLR TOS
@@ -2001,7 +2087,7 @@ zerobranch_backward:
         cmove TOS, Y
         ret
 
-.colon "(+loop)", innerplusloop
+.colon "(+loop)", innerplusloop, LOCAL
         ; move TOS to r8, inject a false result by default
         mov r8, TOS
         CLR TOS
@@ -2027,7 +2113,7 @@ innerplusloopdone:
         mov X, [rsp+CELLSIZE*2]
         ret
 
-.colon "(enddo)", enddo
+.colon "(enddo)", enddo, LOCAL
         ; remove the loop data from return stack
         pop r8
         pop r9
@@ -2046,7 +2132,7 @@ innerplusloopdone:
         DPUSH r8
         ret
 
-.colon "(limit)", dolimit
+.colon "(limit)", dolimit, LOCAL
         mov r8, [rsp+CELLSIZE*2]
         DPUSH r8
         ret
@@ -2149,6 +2235,34 @@ resize_end:
 cmove_end:
         ret
 
+align 4                         ; but why.... :-/
+.colon "CMOVE>", cmovefw        ; ( addr1 addr2 u -- )
+        DPOP rcx
+        DPOP rdi
+        add rdi, rcx
+        dec rdi
+        DPOP rsi
+        add rsi, rcx
+        dec rsi
+        test rcx, rcx
+        jz cmovefw_end
+        std
+        rep movsb
+        cld
+cmovefw_end:
+        ret
+
+;; this is supposed to NOT propagate when addresses overlap
+.colon "MOVE", move           ; ( addr1 addr2 u -- )
+        DPOP rcx
+        DPOP rdi
+        DPOP rsi
+        test rcx, rcx
+        jz move_end
+        rep movsq
+move_end:
+        ret
+
 .colon "FILL", fill             ; ( addr u c -- )
         DPOP rax
         DPOP rcx
@@ -2183,10 +2297,11 @@ filenamestr:
         call fill
 
         DPUSH filenamestr
-        call swap               ; ( fam a-addr fstr u )
-        call cmove              ; ( fam )  ; mode
+        call swap               ; ( fam c-addr fstr u )
+        call cmove              ; ( fam )  ; flags
 
-        DPUSH 0                 ; flags
+        DPUSH 0                 ; permissions, apparently
+        call swap
         DPUSH filenamestr       ; C-filename pointer
         DPUSH 2
         call colonsyscall3
@@ -2205,18 +2320,30 @@ filenamestr:
 ;; ( addr n -- )
 .colon "INCLUDED", included
         ; save input specification directly to rstack
-        push qword 4
+        push qword 4            ; shouldn't this be the top value...?
+                                ; it's never used anyway...
+                                ; the regular mechanism uses
+                                ; the data stack
         push qword [val_sourceid]
         push qword [val_TOIN]
         push qword [val_sourcelen]
         push qword [val_sourceaddr]
 
         ; open the file read only
-        DPUSH val_rofam
+        DPUSH 0
         call openfile
 
-        ; ignore errors for now, what could possibly go wrong :-D
-        DPOP r8
+        ; give notice if it doesn't exist
+        DPOP r8                 ; (-x if error)
+        test r8, r8
+        jns included_file_exists
+
+        DPUSH notFoundMsgStr
+        DPUSH notFoundMsgLen
+        call type
+        jmp included_restore_input
+
+included_file_exists:
         ; store the source-id
         DPOP r8
         mov [val_sourceid], r8
@@ -2257,6 +2384,7 @@ included_done:
         call closefile
         DPOP r8                 ; and yet some more
 
+included_restore_input:
         ; restore input specification
         pop qword [val_sourceaddr]
         pop qword [val_sourcelen]
@@ -2294,21 +2422,18 @@ included_done:
         call dp
         call store
 
+        ; compile a flags byte
+        DPUSH 0
+        call dp
+        call fetch
+        call cstore
+        ; increment dictionary pointer
+        DPUSH 1
+        call dp
+        call cplusstore
+
         call bl_                ; get the word name
         call word_              ; which will be on WORDBUFFER as a c-string
-
-        ; then flags+count followed by the name
-        ;; call dup
-        ;; call cfetch
-        ;; DPUSH 1
-        ;; call plus
-        ;; DPOP rcx                ; we will copy count+1 bytes
-        ;; DPOP rsi
-        ;; DPUSH rcx               ; let's keep the size on the stack
-        ;; call dp
-        ;; call fetch
-        ;; DPOP rdi
-        ;; rep movsb
 
         ; update here (we left the address on the stack)
         call dup
@@ -2350,12 +2475,12 @@ included_done:
 end_of_builtins:
 ;; should I add a blob of uninitialised (or initialised) space here?
 
-        resb 65536
+        resb 65536*4
 end_of_dictionary:
 
 ;; the program code here
 SECTION .text
-align CELLSIZE
+;align 4
 
 global _start
 

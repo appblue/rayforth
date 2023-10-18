@@ -1,7 +1,8 @@
 #! /home/raydj/forth/rayforth/rayforth-launcher
 
-( this is a test flag )
-\ 1234567890
+CREATE builtins---->
+
+: INCLUDE  ( "filename" -- )  BL WORD COUNT INCLUDED ;
 
 : EXIT $C2 C, 0 C, 0 C, ; IMMEDIATE
 
@@ -12,31 +13,37 @@
 : CELL+  ( addr -- addr' ) 8 + ;
 : CELLS  ( n -- n*cellsize ) 8 * ;
 
-: S>D    ( u -- ud )   0 SWAP ;
-
-: >NAME  8 + ;
-: >CODE  8 + COUNT + ;
+: >FLAGS  CELL+ ;
+: >NAME   >FLAGS 1+ ;
+: >CODE   >NAME COUNT + ;
 
 : RECURSE ['] (branch) COMPILE, LATEST @ >CODE , ; IMMEDIATE
-
-: IF    ['] (0branch) COMPILE, HERE 0 , ; IMMEDIATE
-: THEN  HERE SWAP ! ; IMMEDIATE
-
-: FOR   ['] (for) COMPILE, HERE ; IMMEDIATE
-: NEXT
-  ['] (next) COMPILE,
-  ['] I COMPILE,
-  ['] 0= COMPILE,
-  ['] (0branch) COMPILE, ,
-  ['] (endfor) COMPILE,
-; IMMEDIATE
 
 : DODOES   R> R> SWAP >R ;
 : (DOES>)  R>  LATEST @ >CODE COMPILE@ ;
 : DOES>    ['] (DOES>) COMPILE, ['] DODOES COMPILE, ; IMMEDIATE
 
+0 ,                             ( sigh... )
+
+: IF    ['] (0branch) COMPILE, HERE 0 , ; IMMEDIATE
+: ELSE  ['] (branch)  COMPILE, HERE 0 ,  HERE ROT ! ; IMMEDIATE
+: THEN  HERE SWAP ! ; IMMEDIATE
+: ?IF   ['] ?DUP COMPILE, ['] (0branch) COMPILE, HERE 0 , ; IMMEDIATE
+
 : CONSTANT CREATE , DOES> @ ;
 : VARIABLE CREATE 0 , ;
+
+\ for some reason alignment seems to matter... this should help
+: aligned  ( u-addr -- a-addr )  4 rshift 4 lshift 16 + ;
+: align    ( -- )  here aligned dp ! ;
+
+: 2@  ( addr -- u1 u2 )  dup cell+ @ swap @ ;
+: 2!  ( u1 u2 addr -- )  tuck ! cell+ ! ;
+
+: 2CONSTANT CREATE , , DOES> 2@ ;
+: 2VARIABLE CREATE 0 , 0 , ;
+
+: WITHIN ( u/n lo hi -- f ) OVER - >R - R> U< ;
 
 : DO   ['] (do) COMPILE, HERE ; IMMEDIATE
 : LOOP
@@ -49,25 +56,41 @@
   ['] (0branch) COMPILE, ,
   ['] (enddo) COMPILE,
 ; IMMEDIATE
+: UNLOOP  ['] (enddo) COMPILE, ; IMMEDIATE
+: LEAVE   ( not sure how to go about this right now...) ;
 
 : BEGIN   HERE ; IMMEDIATE
-: UNTIL   ( ['] 0= COMPILE, ) ['] (0branch) COMPILE, , ; IMMEDIATE
+: UNTIL   ['] (0branch) COMPILE, , ; IMMEDIATE
 : AGAIN   ['] (branch) COMPILE, , ; IMMEDIATE
 : WHILE   ['] (0branch) COMPILE, HERE 0 , ; IMMEDIATE
+: ?WHILE  ['] ?DUP COMPILE, ['] (0branch) COMPILE, HERE 0 , ; IMMEDIATE
 : REPEAT  SWAP ['] (branch) COMPILE, ,  HERE SWAP ! ; IMMEDIATE
+
+\ the following logic is prone to false positives, but only if the
+\ word name exceeds 32 characters, at which point you have a naming
+\ problem, which is way worse
+: XT>NAME  ( addr -- addr' )
+  DUP >R BEGIN                          \ addr' | addr0
+    1-                                  \ addr'-1 | addr0
+    DUP C@ 1+                           \ addr'-1 len?+1 | addr0
+    OVER + R@ =                         \ addr'-1 found? | addr0
+  UNTIL
+  R> DROP                               \ addr'
+;
+
+: XT>LINK  ( addr -- addr' )  XT>NAME 1 CELLS - 1- ;
+
+INCLUDE localwords.fs
 
 : WORDS
   LATEST @
   BEGIN
     DUP >NAME
-    COUNT  $7F AND  TYPE BL EMIT
+    COUNT  TYPE BL EMIT
     @ DUP 0=
   UNTIL
   DROP
 ;
-
-( print the test flag )
-\ . CR
 
 : LITERAL  ( x -- ) ['] LIT COMPILE, , ; IMMEDIATE
 
@@ -84,20 +107,21 @@
 : UNDER+  ( a b c -- a+c b )  ROT + SWAP ;
 : SPACE   ( -- )  BL EMIT ;
 : SPACES  ( n -- )  DUP 0 > IF  0 DO  BL EMIT  LOOP  EXIT THEN  DROP ;
-: ZEROS   ( n -- )  DUP 0 > IF  0 DO  [CHAR] 0 EMIT  LOOP  EXIT THEN  DROP ;
+: ZEROS   ( n -- )  DUP 0 > IF  0 DO  '0 EMIT  LOOP  EXIT THEN  DROP ;
 
-CREATE <pno> 256 ALLOT
-VARIABLE #<pno>
+CREATE <pno> 256 ALLOT LOCAL
+VARIABLE #<pno> LOCAL
+VARIABLE sign? LOCAL
 
-\ these should respect BASE, rewrite (the CHAR 0 + part)
-: <# ( -- )  <pno> 256 ERASE  255 #<pno> ! ;
-: #  ( ud1 -- ud2 )
-  BASE @ UM/MOD  [CHAR] 0 +  <pno> #<pno> @ +  C!
-  -1 #<pno> +!  S>D
+: <# ( u/n -- u )  <pno> 256 ERASE  256 #<pno> !  dup 0 < sign? ! abs ;
+: #  ( u1 -- u2 )
+  -1 #<pno> +!
+  0  BASE @ UM/MOD  SWAP BASEDIGITS + c@  <pno> #<pno> @ +  C!
 ;
-: #S ( ud1 -- 0 0 )  BEGIN  # DUP  WHILE REPEAT  ;
-: #> ( xd -- c-addr u )  2DROP <pno> 256 + #<pno> @ - #<pno> @ ;
-
+: #S ( u1 -- 0 )  BEGIN  # DUP  WHILE REPEAT ;
+: #> ( u -- c-addr u )  DROP  <pno> #<pno> @ +  256 #<pno> @ - ;
+: HOLD  ( c -- )  <pno> #<pno> @ +  C!  -1 #<pno> +! ;
+: SIGN  ( u -- u )  sign? @ 0 < IF  '- HOLD  THEN ;
 
 : U.R  ( rlen u -- )
   TUCK  BEGIN  -1 UNDER+ BASE @ / DUP  WHILE REPEAT  DROP SPACES ..
@@ -107,7 +131,9 @@ VARIABLE #<pno>
   TUCK  BEGIN  -1 UNDER+ BASE @ / DUP  WHILE REPEAT  DROP ZEROS ..
 ;
 
-: AT  ( x y -- )  <ESC> <CSI> .. [CHAR] ; EMIT .. [CHAR] H EMIT    ;
+: AT  ( x y -- )
+  <ESC> <CSI> 1+ .. [CHAR] ; EMIT 1+ .. [CHAR] H EMIT
+;
 
 : ATTR:  ( "name" n -- )
   CREATE , DOES> <ESC> <CSI> @ EMIT [CHAR] m EMIT
@@ -133,7 +159,7 @@ CHAR 8 ATTR: <INVISIBLE>
 : FG  ( n -- )  <ESC> <CSI> 3 .. .. [CHAR] m EMIT ;
 : BG  ( n -- )  <ESC> <CSI> 4 .. .. [CHAR] m EMIT ;
 
-: (ior)  ( n -- ior ) 0 < ;
+: (ior)  ( n -- ior ) 0 < ; LOCAL
 
 : READ-FILE  ( c-addr u1 fid -- u2 ior )
   ROT SWAP 0 SYSCALL/3 DUP (ior)
@@ -144,51 +170,28 @@ CHAR 8 ATTR: <INVISIBLE>
 ;
 
 : WRITE-LINE  ( c-addr u1 fid -- u2 ior )
-  ROT SWAP 1 SYSCALL/3 DUP (ior)
-  BL  1 SYSCALL/3 DUP (ior)
+  dup >R  ROT SWAP 1 SYSCALL/3 DUP (ior)
+  10 1 PSP 1 cells + R> 1 SYSCALL/3 DUP (ior)
 ;
 
-\ fix to make fully compliant...?
-
-: FORTH-READ-LINE  ( c-addr u1 fileid -- u2 flag ior )
-  ROT SWAP 0 -ROT            ( u1 0 c-addr fileid )
-  BEGIN
-    2DUP 1 SWAP              ( u1 0 c-addr fileid c-addr 1 fileid )
-    READ-FILE ( u1 0 c-addr fileid u2 ior )
-    IF  >R 2DROP 2DROP R> DUP TRUE EXIT  THEN DROP
-    ( u1 0 c-addr fileid u2 )
-  WHILE  ( u1 0 c-addr fileid )                          \ if no chars read, exit
-      OVER C@ 10 =  IF  2DROP NIP TRUE FALSE EXIT  THEN  \ if newline exit
-      1 UNDER+ 2SWAP 1+ ( c-addr+1 fileid u1 0+1 )
-      2DUP =  IF  DROP -ROT 2DROP TRUE FALSE EXIT  THEN   \ if max chars exit
-      2SWAP             ( u1 0+1 c-addr+1 fileid )
-
-      SWAP COUNT 10 =  IF  2DROP NIP TRUE FALSE EXIT  THEN  \ if newline exit
-      SWAP 2SWAP 1+     ( c-addr+1 fileid u1 0+1 )
-      2DUP =  IF  DROP -ROT 2DROP TRUE FALSE EXIT  THEN   \ if max chars exit
-      2SWAP             ( u1 0+1 c-addr+1 fileid )
-  REPEAT
-  2DROP 2DROP 0 FALSE FALSE
+: FILE-POSITION  ( fid -- u ior )
+  1 0 ROT 8 SYSCALL/3 DUP (ior)
 ;
 
-: FILE-POSITION  ( fid -- ud ior )
-  1 0 ROT 8 SYSCALL/3 S>D DUP (ior)
-;
-
-: FILE-SIZE  ( fid -- ud ior )
+: FILE-SIZE  ( fid -- u ior )
   DUP DUP FILE-POSITION DROP
   ROT 2 0 ROT 8 SYSCALL/3 >R
   ROT 8 SYSCALL/3 DROP
-  DROP R> S>D DUP (ior)
+  DROP R> DUP (ior)
 ;
 
-: REPOSITION-FILE  ( ud fid -- ior )
-  ( use the sure-to-be 0 as SEEK_SET )
-  8 SYSCALL/3 (ior)
+: REPOSITION-FILE  ( u fid -- ior )
+  0 ( <-SEEK_SET ) -rot  8 SYSCALL/3 (ior)
 ;
 
 \ only one buffer for now
-CREATE <STRINGBUFFER> 256 ALLOT
+local.start
+CREATE <STRINGBUFFER> 256 ALLOT LOCAL
 
 : <S">  ( "string" -- addr n )
   [CHAR] " WORD
@@ -196,8 +199,9 @@ CREATE <STRINGBUFFER> 256 ALLOT
   SWAP <STRINGBUFFER> 1 + SWAP CMOVE
   <STRINGBUFFER> COUNT
 ;
+local.end
 
-: (S")  ( R: addr -- R: addr> )  R>  COUNT  2DUP +  >R  ;
+: (S")  ( R: addr -- addr u | R: addr> )  R>  COUNT  2DUP +  >R  ;
 
 : S"  ( "string" -- addr n )
   STATE @ 0= IF  <S">  EXIT THEN
@@ -205,14 +209,23 @@ CREATE <STRINGBUFFER> 256 ALLOT
   COUNT + DP !
 ; IMMEDIATE
 
-: (abort")  S" ¯\_(ツ)_/¯ <{ " TYPE TYPE S"  }" TYPE ABORT ;
+: ."  ( "name" -- )  POSTPONE S"  ['] TYPE COMPILE, ; IMMEDIATE
+: .(  ( "name" -- )  ') WORD COUNT TYPE ;
+
+: (abort")  ( u -- )
+  IF  S" ¯\_(ツ)_/¯ <{ " TYPE TYPE S"  }" TYPE CR ABORT  THEN
+  2DROP
+; LOCAL
 
 : ABORT"  ( "msg" -- )
   ['] (S") COMPILE,  [CHAR] " WORD
   COUNT + DP !
-  \ ['] S" LITERAL ['] COMPILE, COMPILE,
+  ['] ROT COMPILE,
   ['] (abort") COMPILE,
 ; IMMEDIATE
+
+\ reads the newline too... :-/
+: ACCEPT  ( c-addr +n1 -- +n2 )  0 read-file abort" ACCEPT error" 1- ;
 
 
 \ format is:
@@ -231,62 +244,14 @@ CREATE <STRINGBUFFER> 256 ALLOT
   TRUE
 ;
 
-: FORTH-INCLUDED ( addr n -- )
-  \ save current input specification ( addr size >in source-id n )
-  SAVE-INPUT >R >R >R >R >R
-  \ open the file
-  R/O OPEN-FILE ( ior ) DROP
-  \ store the fid in source-id
-  SOURCE-ID !
-  \ make the file the input source (??)
-  1024 DUP <sourcelen> !
-  ALLOCATE ( ior ) DROP <sourceaddr> !
-
-  \ store 0 in BLK
-  0 BLK !
-
-  \ repeat until eof
-  \   read line into input buffer, set >in to 0,  interpret
-  BEGIN
-    REFILL
-  WHILE
-      0 >IN !  INTERPRET
-  REPEAT
-
-  \ free buffer
-  SOURCE DROP FREE ( ior ) DROP
-  \ close file
-  \ restore input specification
-  R> R> R> R> R> RESTORE-INPUT ( flag ) DROP
-;
-
 : (dump)  ( addr -- )
   HEX
   8 OVER U0.R  SPACE DUP 16 + SWAP DO 2 I C@ U0.R SPACE LOOP
-  DECIMAL CR ;
+  DECIMAL CR
+; LOCAL
 : DUMP    ( addr n -- )  OVER + SWAP  DO  I (dump)  16 +LOOP ;
 
-: (fetch32) ( addr -- u32 )
-  0 SWAP
-  32 0 DO
-    COUNT I LSHIFT UNDER+
-  8 +LOOP
-  DROP
-  DUP $80000000 AND IF  $FFFFFFFF00000000 OR  THEN \ sign extend
-;
-
-
-: XT>NAME  ( addr -- addr' )
-  DUP >R BEGIN                          \ addr' | addr0
-    DUP C@ $7F AND 1+                   \ addr' len?+1 | addr0
-    OVER + R@ <>                        \ addr' notfound? | addr0
-  WHILE
-      1-                                \ addr'-1 | addr0
-  REPEAT
-  R> DROP                               \ addr'
-;
-
-s" see.fs" INCLUDED
+INCLUDE see.fs
 
 : args   ( -- args-addr )  rp0@ 3 cells + ;
 : nargs  ( -- n )  rp0@ 2 cells + @ ;
@@ -299,9 +264,274 @@ s" see.fs" INCLUDED
 ;
 
 : forget ( "name" -- )
-  bl word find 0= if abort" word not found" then
+  bl word find 0=  abort" word not found"
   xt>name 1 cells -  dup dp !  @ latest !
 ;
+
+: VALUE CREATE , DOES> @ ;
+
+: <TO>  ( "string" u -- )
+  BL WORD FIND 0= ABORT" value not found"
+  \ maybe should test if it's a value
+  \ on the other hand, read what you write...?
+  5 + !                         \ skip code, store in data
+; LOCAL
+
+: (TO)  ( u | R: addr -- R: addr> )
+  R> DUP CELL+ >R  @ !
+; LOCAL
+
+: TO  ( "name" u -- )
+  STATE @ 0= IF  <TO>  EXIT THEN
+  ['] (TO) COMPILE,
+  BL WORD FIND 0= ABORT" value not found"
+  5 + ,
+; IMMEDIATE
+
+: <+TO>  ( "string" u -- )
+  BL WORD FIND 0= ABORT" value not found"
+  5 +  DUP @ UNDER+ !           \ skip code, store in data
+; LOCAL
+
+: (+TO)  ( u | R: addr -- R: addr> )
+  R> DUP CELL+ >R  @  DUP @ UNDER+  !
+; LOCAL
+
+: +TO  ( "name" u -- )
+  STATE @ 0= IF  <+TO>  EXIT THEN
+  ['] (+TO) COMPILE,
+  BL WORD FIND 0= ABORT" value not found"
+  5 + ,
+; IMMEDIATE
+
+: DEFER  ( "name" -- )
+  CREATE 0 ,                    \ maybe a default deferred instead?
+  DOES> @ EXECUTE
+;
+
+\ BLOCKS code --------------------------------------------------
+variable BLK
+variable SCR
+variable cbuf LOCAL
+
+variable <blockfd> LOCAL
+
+: USE  ( "name" -- )
+  <blockfd> @ ?dup if  close-file abort" error closing blocks file" then
+  0 <blockfd> !
+  BL WORD COUNT r/w open-file abort" error opening blocks file"
+  <blockfd> !
+;
+
+\ block -1 is not valid in a mapping, it means "no block"  (yes?)
+create <mapping>  LOCAL 64 CELLS allot
+create <buffers>  LOCAL 64 1024 * allot
+<mapping> 64 cells -1 fill
+
+\ bitvector to keep track of updated buffers
+variable <updated> LOCAL
+: BIT      ( u -- mask )  1 swap lshift ;
+: CLEAR  ( mask addr -- )  tuck @ xor swap ! ;
+: SET    ( mask addr -- )  tuck @ or  swap ! ;
+: TEST   ( mask addr -- f )  tuck @ and 0<> ;
+
+: buf>map  ( baddr -- maddr )  <buffers> - 128 / <mapping> + ; LOCAL
+: map>buf  ( baddr -- maddr )  <mapping> - 128 * <buffers> + ; LOCAL
+: map>bit  ( maddr -- ubit )   <mapping> - 8 / BIT ; LOCAL
+: map>blk  ( maddr -- blk# )   @ ; LOCAL
+: range    ( -- limit base )  <mapping> dup 64 cells under+ ; LOCAL
+: updated? ( maddr -- f )  map>bit <updated> @ AND 0<> ; LOCAL
+
+: read     ( u baddr -- )
+  swap 1024 * <blockfd> @ reposition-file abort" error seeking blocks file"
+  1024 <blockfd> @ READ-FILE ABORT" error reading blocks file"
+  drop
+; LOCAL
+
+: write    ( maddr -- )
+  dup  map>blk 1024 * <blockfd> @ reposition-file abort" error seeking blocks file"
+  map>buf 1024 <blockfd> @ write-file abort" error writing blocks file"
+  drop
+; LOCAL
+
+: mapping  ( u -- maddr/false )
+  range DO
+    DUP I @ = IF  drop I UNLOOP EXIT  THEN
+  1 CELLS +LOOP
+  drop FALSE
+; LOCAL
+
+: map    ( u maddr -- )  ! ; LOCAL
+
+: unmap  ( maddr -- )
+  dup updated? IF  dup write  THEN
+  dup map>bit <updated> clear
+  -1 swap !
+; LOCAL
+
+: BLOCK   ( u -- baddr )
+  DUP mapping  ?DUP IF  nip map>buf  dup cbuf ! exit  then
+  -1 mapping  ?DUP IF  2dup map  map>buf  tuck read  dup cbuf ! exit then
+  \ unmap... but which block? always the first one?
+  \ use some LRU strategy where mapping positions swap on access?
+  <mapping>  dup unmap  2dup map  map>buf  tuck read  dup cbuf !
+;
+
+: BUFFER  ( u -- addr )
+  DUP mapping  ?DUP IF  nip map>buf  dup cbuf ! exit  then
+  -1 mapping  ?DUP IF  tuck map  map>buf  dup cbuf ! exit  then
+  <mapping>  dup unmap  tuck map  map>buf  dup cbuf !
+;
+
+: EMPTY-BUFFERS  ( -- )  <mapping> 64 CELLS erase ;
+
+: SAVE-BUFFERS   ( -- )
+  range do  I updated? if  I write  then  1 cells +loop  0 <updated> !
+;
+
+: FLUSH   ( -- ) save-buffers <mapping> 64 cells erase ;
+
+\ can be factored better, maybe... not right now :-)
+\ block 0 cannot be LOADed, because BLK would be set to 0,
+\ which makes the terminal the input source,
+\ however it can be BLOCKed, LISTed, etc
+: LOAD    ( i*x u -- j*x )
+  dup 0= if  true abort" Cannot LOAD block 0"  then
+  >R save-input R>
+  dup  block  <sourceaddr> !  blk !
+  1024 <sourcelen> !
+  0 >in !
+  interpret
+  restore-input  0 blk !  0= abort" restore-input failed"
+;
+
+: THRU    ( i * x u1 u2 -- j * x ) 1+ swap DO  I load  LOOP ;
+
+: UPDATE  ( -- )
+  cbuf @ buf>map map>bit <updated> @ OR <updated> !
+;
+
+: LIST    ( u -- )
+  dup SCR !
+  block 16 0 DO  I 64 * OVER + 64 type cr  loop
+  drop
+;
+
+\ extend backslash, REFILL, and EVALUATE (which we don't have yet)
+: \  ( "some text" -- )
+  BLK @ IF
+    >in @   6 rshift 6 lshift   64 + >in ! exit
+  THEN
+  postpone \
+; IMMEDIATE
+\ BLOCKS code end ----------------------------------------------
+
+include string.fs
+
+CREATE needle 32 allot LOCAL
+CREATE haystack 32 allot LOCAL
+
+: WORDS.LIKE  ( "name" -- )
+  BL WORD COUNT  needle c!  needle COUNT CMOVE
+  needle COUNT upcase!
+
+  LATEST @ BEGIN  ( linkaddr )
+    DUP >NAME COUNT  haystack c!  haystack COUNT CMOVE
+    haystack COUNT upcase!
+    haystack COUNT needle COUNT SEARCH -ROT 2DROP
+    IF  DUP >NAME COUNT type space  THEN
+    @ DUP 0=
+  UNTIL
+;
+
+\ fork and exec things
+: fork  ( -- f )  $39 syscall/0 ;
+
+CREATE <args>  LOCAL here 1024 dup allot erase
+CREATE <args*> LOCAL here 16 cells dup allot erase
+VARIABLE <argc> LOCAL
+0 CONSTANT NULLENV LOCAL
+
+: add-arg  ( c-addr u addr -- addr' )
+  dup  <args*> <argc> @ cells +  ! \ set up the pointer in args*
+  2dup 2>R                         \ save address and count
+  swap cmove                       \ copy to <args>
+  2R> +                            \ restore and move past
+  0 over c! 1+                     \ store 0 and move past
+  0 over c!                        \ store another 0, end of array
+  1 <argc> +!                      \ increment arg count
+; LOCAL
+
+: exec  ( c-addrn un ... c-addr1 u1 argc c-addr u -- n )
+  0 <argc> !  <args*> 16 cells erase
+  <args> add-arg                   \ first arg is the pathname
+  swap ?dup if
+    0 do  add-arg  loop            \ copy args
+  then  drop
+  NULLENV <args*> <args>  $3B syscall/3
+;
+
+: (system)  ( c-addrn un ... c-addr1 u1 argc c-addr u -- )
+  fork dup 0 < abort" error forking" if
+    ( wait for child )
+    2drop exit
+  then
+  exec ." error executing" bye     \ execute in forked process
+;
+
+: system  ( c-addrn un ... c-addr1 u1 argc "pathname" -- )
+  BL WORD COUNT (system)
+;
+
+\ --- thoughts on non-buffered KEY and such -------------
+\ use stty -icanon -echo before starting
+\ use stty icanon echo after exiting
+\ echoing will be disabled, but so will be buffering
+\ not disabling echo causes double characters and oddness
+\ anyway we need a way to see what's being typed
+\ key will still be blocking but not buffered anymore
+\ -------------------------------------------------------
+
+: buffered    ( -- )
+  s" icanon" s" echo" 2 s" /bin/stty" (system) drop 2drop 2drop
+;
+
+: unbuffered  ( -- )
+  s" -icanon" s" -echo" 2 s" /bin/stty" (system) drop 2drop 2drop
+;
+
+\ key?
+CREATE pollfd
+0 c, 0 c, 0 c, 0 c,             \ fd
+1 c, 0 c,                       \ events
+0 c, 0 c,                       \ revents
+
+: poll  ( timeout nfds fds* -- u )
+  $07 syscall/3  dup -1 = abort" poll error"
+;
+
+: key?  ( -- f )  0 1 pollfd poll ;
+
+
+\ PRNG stuff  ( https://prng.di.unimi.it/ )
+2variable xoshiro128+state  $DEADBEEF xoshiro128+state !
+
+: rotl  ( x k -- u )  2dup lshift  -rot  64 swap - rshift  or ;
+
+: xoshiro128+  ( -- u )
+  xoshiro128+state 2@  2dup + -rot \ result
+  xor
+  xoshiro128+state @ 24 rotl  over xor  over 16 lshift xor
+  swap 37 rotl  swap xoshiro128+state 2!
+;
+
+
+\ almost ready to boot
+
+\ Process all local words defined either in assembly or boot.fs. The
+\ very first word defined is TRUE, so we take that address as the
+\ start of local area.
+' TRUE XT>LINK local.end
 
 : HELLO
   S" boot.fs loaded" TYPE CR
